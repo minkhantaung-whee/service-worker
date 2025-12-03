@@ -7,6 +7,34 @@ const SYNC_DB = "sw-tester-sync";
 const OUTBOX_STORE = "outbox";
 
 let lifecycleState = "booting";
+let runtimeStrategy = "network-first";
+
+const STRATEGY_VALUES = new Set([
+	"network-first",
+	"cache-first",
+	"stale-while-revalidate",
+	"cache-only",
+	"network-only",
+]);
+
+const currentStatePayload = () => ({
+	state: lifecycleState,
+	version: VERSION,
+	strategy: runtimeStrategy,
+});
+
+const notifyStrategy = async (client, message) => {
+	const data = {
+		type: "FETCH_STRATEGY",
+		payload: { strategy: runtimeStrategy },
+	};
+	if (message) data.message = message;
+	if (client) {
+		sendToClient(client, data);
+		return;
+	}
+	await broadcast(data);
+};
 
 const log = (...args) => {
 	console.log("[SW]", ...args);
@@ -120,6 +148,7 @@ const maybeEnableNavigationPreload = async () => {
 };
 
 const cacheRuntimeResponse = async (request, response) => {
+	if (!response || response.status >= 400) return;
 	const cache = await caches.open(RUNTIME_CACHE);
 	await cache.put(request, response.clone());
 };
@@ -155,24 +184,74 @@ const handleNavigationRequest = async (event) => {
 	}
 };
 
-const fetchWithCache = async (request) => {
+const networkFirstStrategy = async (request) => {
 	try {
 		const response = await fetch(request);
-		const url = new URL(request.url);
-		if (url.origin === self.location.origin) {
-			cacheRuntimeResponse(request, response);
-		}
+		await cacheRuntimeResponse(request, response);
 		return response.clone();
 	} catch (error) {
-		log("Fetch failed, trying cache for", request.url);
+		log("Network-first fallback for", request.url, error);
+		const cached = await caches.match(request);
+		return cached || offlineFallback(request);
+	}
+};
+
+const cacheFirstStrategy = async (request) => {
+	const cached = await caches.match(request);
+	if (cached) return cached;
+	try {
+		const response = await fetch(request);
+		await cacheRuntimeResponse(request, response);
+		return response.clone();
+	} catch (error) {
+		log("Cache-first fallback for", request.url, error);
 		return offlineFallback(request);
 	}
 };
 
-const cacheFirst = async (request) => {
+const staleWhileRevalidateStrategy = async (request) => {
+	const cache = await caches.open(RUNTIME_CACHE);
+	const cached = await cache.match(request);
+	const networkPromise = fetch(request)
+		.then(async (response) => {
+			await cacheRuntimeResponse(request, response);
+			return response.clone();
+		})
+		.catch((error) => {
+			log("SWR network error for", request.url, error);
+			return null;
+		});
+
+	if (cached) {
+		networkPromise.catch(() => {});
+		return cached;
+	}
+
+	const network = await networkPromise;
+	return network || offlineFallback(request);
+};
+
+const cacheOnlyStrategy = async (request) => {
 	const cached = await caches.match(request);
 	if (cached) return cached;
-	return fetchWithCache(request);
+	return offlineFallback(request);
+};
+
+const networkOnlyStrategy = async (request) => {
+	try {
+		return await fetch(request);
+	} catch (error) {
+		log("Network-only failed for", request.url, error);
+		return offlineFallback(request);
+	}
+};
+
+const STRATEGY_HANDLERS = {
+	"network-first": networkFirstStrategy,
+	"cache-first": cacheFirstStrategy,
+	"stale-while-revalidate": staleWhileRevalidateStrategy,
+	"cache-only": cacheOnlyStrategy,
+	"network-only": networkOnlyStrategy,
 };
 
 const respondToMessage = async (event, data) => {
@@ -184,8 +263,26 @@ const respondToMessage = async (event, data) => {
 			lifecycleState = lifecycleState || "activated";
 			sendToClient(source, {
 				type: "SW_STATE",
-				payload: { state: lifecycleState, version: VERSION },
+				payload: currentStatePayload(),
 				message: `Service worker ready (state: ${lifecycleState}).`,
+			});
+			event.waitUntil(notifyStrategy(source));
+			break;
+		}
+		case "REQUEST_STATE": {
+			sendToClient(source, {
+				type: "SW_STATE",
+				payload: currentStatePayload(),
+				message: `Service worker state: ${lifecycleState}.`,
+			});
+			event.waitUntil(notifyStrategy(source));
+			break;
+		}
+		case "REQUEST_VERSION": {
+			sendToClient(source, {
+				type: "SW_VERSION",
+				payload: { version: VERSION },
+				message: `Service worker version: ${VERSION}.`,
 			});
 			break;
 		}
@@ -270,6 +367,28 @@ const respondToMessage = async (event, data) => {
 			sendToClient(source, { type: "PONG", message: "Service worker alive." });
 			break;
 		}
+		case "SET_FETCH_STRATEGY": {
+			const desired = (payload?.strategy || "").toLowerCase();
+			if (!STRATEGY_VALUES.has(desired)) {
+				sendToClient(source, {
+					type: "TOAST",
+					message: `Unknown strategy: ${desired || "(empty)"}.`,
+				});
+				break;
+			}
+			event.waitUntil(
+				(async () => {
+					if (runtimeStrategy === desired) {
+						await notifyStrategy(source);
+						return;
+					}
+					runtimeStrategy = desired;
+					log("Runtime fetch strategy set to", runtimeStrategy);
+					await notifyStrategy(null, `Fetch strategy set to ${runtimeStrategy}.`);
+				})()
+			);
+			break;
+		}
 		default: {
 			log("Unknown message from client", data);
 			break;
@@ -321,6 +440,7 @@ self.addEventListener("install", (event) => {
 			await cacheCoreAssets();
 			await self.skipWaiting();
 			await broadcast({ type: "LOG", message: "Core assets cached." });
+			await notifyStrategy(null, `Fetch strategy set to ${runtimeStrategy}.`);
 		})()
 	);
 });
@@ -333,7 +453,12 @@ self.addEventListener("activate", (event) => {
 			await cleanupOldCaches();
 			await maybeEnableNavigationPreload();
 			await self.clients.claim();
-			await broadcast({ type: "SW_STATE", payload: { state: lifecycleState, version: VERSION }, message: "Service worker activated." });
+			await broadcast({
+				type: "SW_STATE",
+				payload: currentStatePayload(),
+				message: "Service worker activated.",
+			});
+			await notifyStrategy(null);
 		})()
 	);
 });
@@ -342,7 +467,7 @@ self.addEventListener("fetch", (event) => {
 	const { request } = event;
 	if (request.method !== "GET") return;
 
-	log("Fetch event:", request.url);
+	log("Fetch event:", request.url, "strategy:", runtimeStrategy);
 
 	const url = new URL(request.url);
 	if (request.mode === "navigate") {
@@ -355,12 +480,8 @@ self.addEventListener("fetch", (event) => {
 		return;
 	}
 
-	if (["style", "script", "image", "font"].includes(request.destination)) {
-		event.respondWith(cacheFirst(request));
-		return;
-	}
-
-	event.respondWith(fetchWithCache(request));
+	const handler = STRATEGY_HANDLERS[runtimeStrategy] || networkFirstStrategy;
+	event.respondWith(handler(request));
 });
 
 self.addEventListener("sync", (event) => {

@@ -1,10 +1,9 @@
 :root {
-  font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
-  line-height: 1.6;
+  font-family: "Segoe UI", Arial, sans-serif;
+  line-height: 1.5;
   font-weight: 400;
-  color: #0f172a;
-  background-color: #eef2ff;
-  font-synthesis: none;
+  color: #1f2933;
+  background-color: #f4f6f8;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -19,16 +18,11 @@
 body {
   margin: 0;
   min-height: 100vh;
-  background-image: radial-gradient(circle at top, #c7d2fe, #eef2ff 48%);
-  color: inherit;
+  background: #f4f6f8;
 }
 
 a {
-  color: #2563eb;
-}
-
-a:hover {
-  color: #1d4ed8;
+  color: inherit;
 }
 
 button,
@@ -39,6 +33,6 @@ textarea {
 
 code,
 pre {
-  font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
-  font-size: 0.875rem;
+  font-family: "Courier New", Courier, monospace;
+  font-size: 0.85rem;
 }
