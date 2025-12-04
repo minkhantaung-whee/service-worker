@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mock Market Offline</title>
+    <style>
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: #0f172a;
+        color: #e2e8f0;
+        font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+        text-align: center;
+        padding: 2rem;
+      }
+      main {
+        max-width: 480px;
+        background: rgba(15, 23, 42, 0.82);
+        border-radius: 20px;
+        padding: 2.5rem 2rem;
+        box-shadow: 0 25px 45px rgba(0, 0, 0, 0.35);
+      }
+      h1 {
+        margin: 0 0 0.75rem;
+        font-size: 1.8rem;
+        letter-spacing: -0.02em;
+      }
+      p {
+        margin: 0 0 0.75rem;
+        line-height: 1.6;
+      }
+      .button {
+        display: inline-block;
+        margin-top: 1.5rem;
+        padding: 0.7rem 1.6rem;
+        border-radius: 999px;
+        background: #38bdf8;
+        color: #0f172a;
+        font-weight: 600;
+        text-decoration: none;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>No Connection</h1>
+      <p>You are offline, but cached products are still available.</p>
+      <p>Reconnect to refresh the catalog or keep browsing cached items.</p>
+      <a class="button" href="/">Try Again</a>
+    </main>
+  </body>
+</html>
