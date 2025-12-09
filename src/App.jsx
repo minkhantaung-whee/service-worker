@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
-const PRODUCTS_URL = "https://fakestoreapi.com/products?limit=8";
+const PRODUCTS_BASE_URL = "https://fakestoreapi.com/products";
+const DEFAULT_PRODUCTS_LIMIT = 8;
+const BACKGROUND_FETCH_LIMIT = 20;
+const PRODUCTS_URL = `${PRODUCTS_BASE_URL}?limit=${DEFAULT_PRODUCTS_LIMIT}`;
+const BACKGROUND_FETCH_URL = `${PRODUCTS_BASE_URL}?limit=${BACKGROUND_FETCH_LIMIT}`;
 const CHECKOUT_ENDPOINT = "https://fakestoreapi.com/carts";
 const CHECKOUT_SYNC_TAG = "mock-market-checkout-sync";
 
@@ -94,9 +98,11 @@ function App() {
     useState(false);
   const [lastSync, setLastSync] = useState("");
   const [backgroundFetchStatus, setBackgroundFetchStatus] = useState("");
+  const [pendingCatalogUpdate, setPendingCatalogUpdate] = useState(null);
   const hasProductsRef = useRef(false);
   const pendingOrderRef = useRef(null);
   const backgroundFetchTimeoutRef = useRef();
+  const productsRequestRef = useRef(PRODUCTS_URL);
 
   const formatter = useMemo(
     () =>
@@ -143,7 +149,12 @@ function App() {
   }, []);
 
   const fetchProducts = useCallback(
-    async ({ silent } = { silent: false }) => {
+    async ({ silent = false, url } = {}) => {
+      const requestUrl = url || productsRequestRef.current;
+      if (url) {
+        productsRequestRef.current = url;
+      }
+
       if (!silent) {
         setLoading(true);
         setError("");
@@ -154,7 +165,7 @@ function App() {
       }
 
       try {
-        const response = await fetch(PRODUCTS_URL);
+        const response = await fetch(requestUrl);
         if (!response.ok) {
           throw new Error(`Unexpected status ${response.status}`);
         }
@@ -163,6 +174,7 @@ function App() {
         setProducts(data);
         hasProductsRef.current = data.length > 0;
         setError("");
+        setPendingCatalogUpdate(null);
       } catch (err) {
         if (!hasProductsRef.current) {
           setError(
@@ -314,6 +326,14 @@ function App() {
     }
   }, [addToast, postMessageToServiceWorker]);
 
+  const previewOfflineFallback = useCallback(async () => {
+    try {
+      await postMessageToServiceWorker("OPEN_OFFLINE_PAGE");
+    } catch (error) {
+      addToast(error.message, "error");
+    }
+  }, [addToast, postMessageToServiceWorker]);
+
   const handleStrategyChange = useCallback(
     async (event) => {
       const { value } = event.target;
@@ -331,6 +351,15 @@ function App() {
     [addToast, cacheStrategy, postMessageToServiceWorker]
   );
 
+  const handlePendingCatalogRefresh = useCallback(() => {
+    const url =
+      pendingCatalogUpdate?.url ||
+      productsRequestRef.current ||
+      BACKGROUND_FETCH_URL;
+    setPendingCatalogUpdate(null);
+    fetchProducts({ url });
+  }, [fetchProducts, pendingCatalogUpdate]);
+
   const startBackgroundFetch = useCallback(async () => {
     if (!navigator.serviceWorker) {
       addToast("Service worker unavailable for background fetch.", "error");
@@ -341,26 +370,33 @@ function App() {
       const registration = await navigator.serviceWorker.ready;
       if (registration.backgroundFetch) {
         const fetchId = `products-refresh-${Date.now()}`;
-        await registration.backgroundFetch.fetch(fetchId, [PRODUCTS_URL], {
-          title: "Mock Market catalog refresh",
-          downloadTotal: 1024,
-        });
-        setBackgroundFetchStatus("Background fetch started.");
+        await registration.backgroundFetch.fetch(
+          fetchId,
+          [BACKGROUND_FETCH_URL],
+          {
+            title: "Mock Market catalog refresh",
+            downloadTotal: 1024,
+          }
+        );
+        setBackgroundFetchStatus(
+          "Background fetch started. Watch for the refresh prompt."
+        );
         setCatalogStatus({
           message:
-            "Background fetch queued. The catalog will refresh when complete.",
+            "Background fetch queued. We will prompt you when the catalog is ready to refresh.",
           tone: "info",
         });
         addToast("Background fetch started.", "info");
       } else {
         await postMessageToServiceWorker("PREFETCH_PRODUCTS", {
-          url: PRODUCTS_URL,
+          url: BACKGROUND_FETCH_URL,
         });
         setBackgroundFetchStatus(
-          "Prefetching products through service worker."
+          "Prefetching products through service worker. Watch for the refresh prompt."
         );
         setCatalogStatus({
-          message: "Prefetch started via service worker.",
+          message:
+            "Prefetch started. We will let you refresh when it is ready.",
           tone: "info",
         });
         addToast(
@@ -426,6 +462,7 @@ function App() {
       if (type === "SW_PRODUCTS" && Array.isArray(payload?.items)) {
         setProducts(payload.items);
         hasProductsRef.current = payload.items.length > 0;
+        setPendingCatalogUpdate(null);
         if (payload.meta) {
           setCatalogStatus(describeCatalogStatus(payload.meta, cacheStrategy));
         } else {
@@ -478,12 +515,17 @@ function App() {
 
       if (type === "SW_BACKGROUND_FETCH_STATUS") {
         const statusText = payload?.status || "";
+        const shouldPersist = Boolean(payload?.persist);
         if (statusText) {
           setBackgroundFetchStatus(statusText);
           clearTimeout(backgroundFetchTimeoutRef.current);
-          backgroundFetchTimeoutRef.current = setTimeout(() => {
-            setBackgroundFetchStatus("");
-          }, 5000);
+          if (shouldPersist) {
+            backgroundFetchTimeoutRef.current = undefined;
+          } else {
+            backgroundFetchTimeoutRef.current = setTimeout(() => {
+              setBackgroundFetchStatus("");
+            }, 5000);
+          }
         }
 
         if (payload?.message) {
@@ -499,6 +541,25 @@ function App() {
           });
           addToast(payload.message, level);
         }
+      }
+
+      if (type === "SW_BACKGROUND_FETCH_READY") {
+        const total =
+          typeof payload?.totalItems === "number" ? payload.totalItems : 0;
+        const message =
+          payload?.message ||
+          (total
+            ? `${total} new product${
+                total === 1 ? "" : "s"
+              } available. Tap to refresh.`
+            : "New products ready. Tap to refresh.");
+
+        setPendingCatalogUpdate({
+          url: payload?.url || BACKGROUND_FETCH_URL,
+          message,
+          totalItems: total,
+          timestamp: payload?.timestamp,
+        });
       }
 
       if (type === "SW_CACHE_STRATEGY" && payload?.strategy) {
@@ -600,6 +661,16 @@ function App() {
         </div>
       </header>
 
+      {pendingCatalogUpdate && (
+        <button
+          type="button"
+          className="catalog-refresh-banner"
+          onClick={handlePendingCatalogRefresh}
+        >
+          {pendingCatalogUpdate.message}
+        </button>
+      )}
+
       <main className="app__content">
         <section className="catalog">
           {error && <div className="app__error">{error}</div>}
@@ -692,6 +763,23 @@ function App() {
                   Background fetch API not available. We fall back to prefetch.
                 </p>
               )}
+            </div>
+
+            <div className="service-panel__group">
+              <p className="service-panel__heading">Offline Fallback</p>
+              <div className="service-panel__buttons">
+                <button
+                  type="button"
+                  className="service-panel__button"
+                  onClick={previewOfflineFallback}
+                >
+                  Preview Offline Page
+                </button>
+              </div>
+              <p className="service-panel__hint">
+                Opens the offline page in this tab so you can verify the
+                fallback.
+              </p>
             </div>
 
             <div className="service-panel__group">

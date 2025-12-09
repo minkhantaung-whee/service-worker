@@ -2,6 +2,7 @@
 
 const STATIC_CACHE = "mock-market-static-v1";
 const API_CACHE = "mock-market-api-v1";
+const IMAGE_CACHE = "mock-market-images-v1";
 const OFFLINE_URL = "/offline.html";
 const CHECKOUT_ENDPOINT = "https://fakestoreapi.com/carts";
 const CHECKOUT_SYNC_TAG = "mock-market-checkout-sync";
@@ -43,14 +44,69 @@ const DEFAULT_CACHE_STRATEGY = "stale-while-revalidate";
 const ALLOWED_CACHE_STRATEGIES = new Set(
   Object.keys(CACHE_STRATEGY_LABELS)
 );
+const KNOWN_CACHES = [STATIC_CACHE, API_CACHE, IMAGE_CACHE];
 
 let currentCacheStrategy = DEFAULT_CACHE_STRATEGY;
+
+const MESSAGE_HANDLERS = {
+  CHECKOUT_SUBMIT: ({ payload }) => handleCheckoutSubmit(payload?.order),
+  PROCESS_CHECKOUT_QUEUE: () => processCheckoutQueue(),
+  SET_CACHE_STRATEGY: ({ payload }) => setCacheStrategy(payload?.strategy),
+  GET_CACHE_STRATEGY: () => broadcastCacheStrategy(),
+  PREFETCH_PRODUCTS: ({ payload }) => prefetchProducts(payload?.url),
+  OPEN_OFFLINE_PAGE: ({ payload, event }) =>
+    (async () => {
+      const clientId = payload?.clientId || event?.source?.id;
+      await broadcast("SW_TOAST", {
+        message: "Opening offline fallback page.",
+        level: "info",
+      });
+      await openOfflinePage(clientId);
+    })(),
+};
 
 function createFallbackProductsResponse() {
   return new Response(JSON.stringify(FALLBACK_PRODUCTS), {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+async function getOfflineResponse() {
+  const cache = await caches.open(STATIC_CACHE);
+  const cachedOffline = await cache.match(OFFLINE_URL);
+  if (cachedOffline) {
+    return cachedOffline;
+  }
+
+  return new Response("<h1>Offline</h1><p>Reconnect to continue.</p>", {
+    headers: { "Content-Type": "text/html" },
+    status: 200,
+  });
+}
+
+async function openOfflinePage(targetClientId) {
+  try {
+    let client = null;
+
+    if (targetClientId) {
+      client = await self.clients.get(targetClientId);
+    }
+
+    if (!client) {
+      const [firstClient] = await self.clients.matchAll({
+        type: "window",
+        includeUncontrolled: true,
+      });
+      client = firstClient || null;
+    }
+
+    if (client && typeof client.navigate === "function") {
+      await client.navigate(OFFLINE_URL);
+    }
+  } catch (error) {
+    /* no-op */
+  }
 }
 
 function onInstall(event) {
@@ -60,7 +116,8 @@ function onInstall(event) {
 
 async function precacheStaticAssets() {
   const cache = await caches.open(STATIC_CACHE);
-  await cache.addAll([OFFLINE_URL, "/sw-core.js"]);
+  await cache.add(new Request(OFFLINE_URL, { cache: "reload" }));
+  await cache.add("/sw-core.js");
 }
 
 function onActivate(event) {
@@ -69,7 +126,7 @@ function onActivate(event) {
       const keys = await caches.keys();
       await Promise.all(
         keys
-          .filter((key) => ![STATIC_CACHE, API_CACHE].includes(key))
+          .filter((key) => !KNOWN_CACHES.includes(key))
           .map((key) => caches.delete(key))
       );
       await self.clients.claim();
@@ -114,29 +171,16 @@ function onFetch(event) {
 
 function onMessage(event) {
   const { type, payload } = event.data || {};
-
-  if (type === "CHECKOUT_SUBMIT") {
-    event.waitUntil(handleCheckoutSubmit(payload?.order));
+  const handler = type ? MESSAGE_HANDLERS[type] : null;
+  if (!handler) {
     return;
   }
 
-  if (type === "PROCESS_CHECKOUT_QUEUE") {
-    event.waitUntil(processCheckoutQueue());
-    return;
-  }
-
-  if (type === "SET_CACHE_STRATEGY") {
-    event.waitUntil(setCacheStrategy(payload?.strategy));
-    return;
-  }
-
-  if (type === "GET_CACHE_STRATEGY") {
-    event.waitUntil(broadcastCacheStrategy());
-    return;
-  }
-
-  if (type === "PREFETCH_PRODUCTS") {
-    event.waitUntil(prefetchProducts(payload?.url));
+  try {
+    const result = handler({ payload, event }) || Promise.resolve();
+    event.waitUntil(result);
+  } catch (error) {
+    event.waitUntil(Promise.reject(error));
   }
 }
 
@@ -156,6 +200,7 @@ function onBackgroundFetchFail(event) {
       status: "Background fetch failed.",
       message: "Background fetch failed. Items will remain cached.",
       level: "error",
+      persist: false,
     })
   );
 }
@@ -166,23 +211,40 @@ function onBackgroundFetchAbort(event) {
       status: "Background fetch aborted.",
       message: "Background fetch was aborted by the browser.",
       level: "warning",
+      persist: false,
     })
   );
 }
 
 async function handleNavigationRequest(request) {
-  try {
-    return await fetch(request);
-  } catch (error) {
-    const cache = await caches.open(STATIC_CACHE);
-    const offlinePage = await cache.match(OFFLINE_URL);
-    return offlinePage || Response.error();
+  const isOnline =
+    typeof navigator !== "undefined" && "onLine" in navigator
+      ? navigator.onLine
+      : true;
+
+  if (!isOnline) {
+    return getOfflineResponse();
   }
+
+  try {
+    const response = await fetch(request);
+    if (response && response.ok) {
+      return response;
+    }
+  } catch (error) {
+    return getOfflineResponse();
+  }
+
+  return getOfflineResponse();
 }
 
 async function handleApiRequest(request) {
   if (isProductsRequest(request)) {
     return handleProductsRequest(request);
+  }
+
+  if (isProductImageRequest(request)) {
+    return handleProductImageRequest(request);
   }
 
   try {
@@ -383,6 +445,32 @@ function isProductsRequest(request) {
   return url.hostname === "fakestoreapi.com" && url.pathname.startsWith("/products");
 }
 
+function isProductImageRequest(request) {
+  const url = new URL(request.url);
+  return url.hostname === "fakestoreapi.com" && url.pathname.startsWith("/img/");
+}
+
+async function handleProductImageRequest(request) {
+  const cache = await caches.open(IMAGE_CACHE);
+  const cached = await cache.match(request);
+  if (cached) {
+    return cached;
+  }
+
+  try {
+    const response = await fetch(request);
+    if (response && (response.ok || response.type === "opaque")) {
+      await cache.put(request, response.clone());
+    }
+    return response;
+  } catch (error) {
+    if (cached) {
+      return cached;
+    }
+    return Response.error();
+  }
+}
+
 async function cacheFirstStrategy(request, { cacheName = STATIC_CACHE } = {}) {
   const cache = await caches.open(cacheName);
   const cached = await cache.match(request);
@@ -569,6 +657,50 @@ async function submitOrder(order) {
   return response.json();
 }
 
+async function cacheProductImages(products) {
+  if (!Array.isArray(products) || !products.length) {
+    return { total: 0, cached: 0, failed: 0 };
+  }
+
+  const urls = Array.from(
+    new Set(
+      products
+        .map((product) => product && product.image)
+        .filter((url) => typeof url === "string" && url.length)
+    )
+  );
+
+  if (!urls.length) {
+    return { total: 0, cached: 0, failed: 0 };
+  }
+
+  const imageCache = await caches.open(IMAGE_CACHE);
+  let cached = 0;
+  let failed = 0;
+
+  for (const url of urls) {
+    try {
+      const request = new Request(url, { mode: "cors" });
+      const existing = await imageCache.match(request);
+      if (existing) {
+        cached += 1;
+        continue;
+      }
+      const response = await fetch(request);
+      if (response && (response.ok || response.type === "opaque")) {
+        await imageCache.put(request, response.clone());
+        cached += 1;
+      } else {
+        failed += 1;
+      }
+    } catch (error) {
+      failed += 1;
+    }
+  }
+
+  return { total: urls.length, cached, failed };
+}
+
 async function prefetchProducts(url) {
   if (!url) {
     return;
@@ -581,22 +713,64 @@ async function prefetchProducts(url) {
       throw new Error("Prefetch returned an invalid response.");
     }
 
-    await broadcastProductsFromResponse(response, {
-      source: "prefetch",
-      strategy: currentCacheStrategy,
-      timestamp: new Date().toISOString(),
+    let products = [];
+    try {
+      const parsed = await response.clone().json();
+      products = Array.isArray(parsed) ? parsed : [];
+    } catch (parseError) {
+      products = [];
+    }
+
+    const identifiers = Array.isArray(products)
+      ? products
+          .map((entry) => entry && entry.id)
+          .filter((identifier) => identifier !== undefined)
+      : [];
+
+    const uniqueProductCount = identifiers.length
+      ? new Set(identifiers).size
+      : Array.isArray(products)
+      ? products.length
+      : 0;
+
+    const imageSummary = await cacheProductImages(products);
+    const timestamp = new Date().toISOString();
+
+    const readyMessage = uniqueProductCount
+      ? `View ${uniqueProductCount} refreshed product${
+          uniqueProductCount === 1 ? "" : "s"
+        }.`
+      : "Catalog refreshed. Tap to update.";
+
+    await broadcast("SW_BACKGROUND_FETCH_READY", {
+      url,
+      totalItems: uniqueProductCount,
+      timestamp,
+      message: readyMessage,
     });
+
+    const imageStatus = imageSummary.total
+      ? imageSummary.failed
+        ? `Cached ${imageSummary.cached}/${imageSummary.total} product image${
+            imageSummary.total === 1 ? "" : "s"
+          }.`
+        : `Cached ${imageSummary.total} product image${
+            imageSummary.total === 1 ? "" : "s"
+          } for offline use.`
+      : "Products cached for offline use.";
 
     await broadcast("SW_BACKGROUND_FETCH_STATUS", {
       status: "Prefetch complete.",
-      message: "Products prefetched and cached.",
-      level: "success",
+      message: `${imageStatus} Refresh to view updates.`,
+      level: imageSummary.failed ? "warning" : "success",
+      persist: true,
     });
   } catch (error) {
     await broadcast("SW_BACKGROUND_FETCH_STATUS", {
       status: "Prefetch failed.",
       message: `Prefetch failed: ${error.message}`,
       level: "error",
+      persist: false,
     });
   }
 }
@@ -605,12 +779,20 @@ async function handleBackgroundFetchSuccess(event) {
   const records = await event.downloads();
   const cache = await caches.open(API_CACHE);
   const aggregatedProducts = [];
+  let primaryRequestUrl = null;
+  let fallbackRequestUrl = null;
 
   for (const record of records) {
     const response = await record.responseReady;
     await cache.put(record.request, response.clone());
+    if (!fallbackRequestUrl) {
+      fallbackRequestUrl = record.request.url;
+    }
 
     if (isProductsRequest(record.request)) {
+      if (!primaryRequestUrl) {
+        primaryRequestUrl = record.request.url;
+      }
       try {
         const data = await response.clone().json();
         if (Array.isArray(data)) {
@@ -622,25 +804,56 @@ async function handleBackgroundFetchSuccess(event) {
     }
   }
 
-  if (aggregatedProducts.length) {
-    await broadcast("SW_PRODUCTS", {
-      items: aggregatedProducts,
-      meta: {
-        source: "background-fetch",
-        strategy: currentCacheStrategy,
-        timestamp: new Date().toISOString(),
-      },
-    });
+  const uniqueProductsMap = new Map();
+  for (const product of aggregatedProducts) {
+    if (product && product.id !== undefined) {
+      uniqueProductsMap.set(product.id, product);
+    }
   }
+
+  const uniqueProducts = uniqueProductsMap.size
+    ? Array.from(uniqueProductsMap.values())
+    : aggregatedProducts;
+  const uniqueProductCount = uniqueProducts.length;
+  const timestamp = new Date().toISOString();
+
+  let imageSummary = { total: 0, cached: 0, failed: 0 };
+  if (uniqueProductCount) {
+    imageSummary = await cacheProductImages(uniqueProducts);
+  }
+
+  const readyMessage = uniqueProductCount
+    ? `View ${uniqueProductCount} refreshed product${
+        uniqueProductCount === 1 ? "" : "s"
+      }.`
+    : "Catalog refreshed. Tap to update.";
+
+  await broadcast("SW_BACKGROUND_FETCH_READY", {
+    url: primaryRequestUrl || fallbackRequestUrl,
+    totalItems: uniqueProductCount,
+    timestamp,
+    message: readyMessage,
+  });
+
+  const imageStatus = imageSummary.total
+    ? imageSummary.failed
+      ? `Cached ${imageSummary.cached}/${imageSummary.total} product image${
+          imageSummary.total === 1 ? "" : "s"
+        }.`
+      : `Cached ${imageSummary.total} product image${
+          imageSummary.total === 1 ? "" : "s"
+        } for offline use.`
+    : "Products cached for offline use.";
 
   await broadcast("SW_BACKGROUND_FETCH_STATUS", {
     status: "Background fetch completed.",
-    message: "Background fetch completed.",
-    level: "success",
+    message: `${imageStatus} Refresh to view updates.`,
+    level: imageSummary.failed ? "warning" : "success",
+    persist: true,
   });
 
   if (event.updateUI) {
-    await event.updateUI({ title: "Catalog updated" });
+    await event.updateUI({ title: "Refresh catalog" });
   }
 }
 
